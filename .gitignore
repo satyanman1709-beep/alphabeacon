@@ -1,12 +1,14 @@
-# Python virtual environment
-.venv/
-
-# Python cache
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# macOS junk
-.DS_Store
+# Virtual environment
+.venv/
 
-# Streamlit secrets (NEVER commit)
+# Streamlit secrets
 .streamlit/secrets.toml
+
+# OS
+.DS_Store
