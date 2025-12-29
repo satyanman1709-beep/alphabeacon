@@ -1,9 +1,7 @@
-# pages/sector_page.py
-from __future__ import annotations
-
 import streamlit as st
 import yfinance as yf
-import pandas as pd
+
+from utils.supabase_client import get_supabase_client
 
 from ui.charts import tradingview_chart
 from ui.analytics_cards import volatility_meter, confidence_gauge, target_cards
@@ -11,119 +9,83 @@ from ui.radar import radar_alpha_chart
 from ui.trend_meters import technical_trend_meter, sentiment_trend_meter
 from ui.options_card import options_card
 
-from analysis.alpha_factors import compute_alpha_factors
-from analysis.price_targets import compute_price_targets
-from analysis.universe import sector_to_tickers
-
 from pages.commentary_engine import generate_commentary
 from pages.options_engine import choose_options_strategy, generate_options_contracts
-
 from utils.state import add_to_watchlist
 
 
-# Map your navbar labels -> dataset sector names
-SECTOR_NAME_MAP = {
-    "Technology": "Information Technology",
-    "Healthcare": "Health Care",
-    "Financials": "Financials",
-    "Industrials": "Industrials",
-    "Energy": "Energy",
-}
+def _fetch_latest_sector_recos(sector: str, limit: int = 3):
+    sb = get_supabase_client()
+
+    # 1) get latest date for this sector
+    resp = (
+        sb.table("daily_recommendations")
+        .select("as_of_date")
+        .eq("sector", sector)
+        .order("as_of_date", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not resp.data:
+        return None, []
+
+    latest_date = resp.data[0]["as_of_date"]
+
+    # 2) get top N rows for that sector/date
+    resp2 = (
+        sb.table("daily_recommendations")
+        .select("rank,ticker,alpha_score,factors,targets")
+        .eq("sector", sector)
+        .eq("as_of_date", latest_date)
+        .order("rank", desc=False)
+        .limit(limit)
+        .execute()
+    )
+
+    return latest_date, (resp2.data or [])
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)  # 6 hours
-def _get_sector_universe() -> dict[str, list[str]]:
-    return sector_to_tickers(force_refresh=False)
-
-
-@st.cache_data(ttl=60 * 30, show_spinner=False)  # 30 minutes
-def _score_sector(sector_label: str, max_names: int = 35) -> list[dict]:
-    """
-    Returns ranked list of dicts:
-      {ticker, alpha_score, tech_score, sent_score, factors}
-    max_names limits how many tickers we score to keep it fast.
-    """
-    mapping = _get_sector_universe()
-
-    gics_name = SECTOR_NAME_MAP.get(sector_label, sector_label)
-    tickers = mapping.get(gics_name, [])
-
-    if not tickers:
-        # fallback: if sector label already matches keys
-        tickers = mapping.get(sector_label, [])
-
-    # Limit to keep app responsive (you can increase later)
-    tickers = tickers[:max_names]
-
-    ranked = []
-    for t in tickers:
-        factors = compute_alpha_factors(t)
-        if not factors:
-            continue
-
-        tech_score = int((factors["momentum"] + factors["trend_strength"]) / 2)
-        sent_score = 70  # placeholder for now
-        alpha_score = int((tech_score + sent_score) / 2)
-
-        ranked.append(
-            {
-                "ticker": t,
-                "alpha_score": alpha_score,
-                "tech_score": tech_score,
-                "sent_score": sent_score,
-                "factors": factors,
-            }
-        )
-
-    ranked.sort(key=lambda x: x["alpha_score"], reverse=True)
-    return ranked
-
-
-def sector_page(sector_label: str):
+def sector_page(sector):
     st.markdown(
         f"""
-        <h1 style='color:#003366; font-size:40px; font-weight:900; margin-bottom:0;'>
-            {sector_label} Sector — Top Picks
+        <h1 style='color:#003366; font-size:40px; font-weight:900;'>
+            {sector} Sector — Top Picks
         </h1>
         """,
-        unsafe_allow_html=True,
+        unsafe_allow_html=True
     )
     st.write("")
 
-    with st.spinner("Scoring sector universe..."):
-        ranked = _score_sector(sector_label)
+    as_of_date, recos = _fetch_latest_sector_recos(sector, limit=3)
 
-    if not ranked:
-        st.error("No ranked results available for this sector right now.")
-        st.caption("Tip: try again in a minute, or increase max_names in _score_sector.")
+    if not recos:
+        st.warning(
+            "No precomputed recommendations found yet. "
+            "Run the daily job (GitHub Actions) once, or check Supabase table."
+        )
         return
 
-    top3 = ranked[:3]
+    st.caption(f"Updated: **{as_of_date}** (precomputed)")
 
-    st.caption(
-        f"Showing top {len(top3)} picks (ranked from the first ~{min(35, len(ranked))} names in sector universe)."
-    )
+    for rec in recos:
+        t = rec["ticker"]
+        alpha_score = rec["alpha_score"]
+        factors = rec.get("factors") or {}
+        targets = rec.get("targets") or {}
 
-    for item in top3:
-        t = item["ticker"]
-        factors = item["factors"]
-        tech_score = item["tech_score"]
-        sent_score = item["sent_score"]
-        alpha_score = item["alpha_score"]
+        # Pull last price for options card
+        df5 = yf.download(t, period="5d", progress=False)
+        last_price = df5["Close"].iloc[-1] if df5 is not None and len(df5) else None
+
+        tech_score = int(factors.get("tech_score", 50))
+        sent_score = int(factors.get("sent_score", 70))
 
         st.subheader(f"📌 {t} — Alpha Score {alpha_score}")
 
-        if st.button(f"Add {t} to Watchlist", key=f"add_{sector_label}_{t}"):
+        if st.button(f"Add {t} to Watchlist", key=f"add_{sector}_{t}"):
             add_to_watchlist(t)
             st.success(f"{t} added to Watchlist!")
-
-        # Price
-        df5 = yf.download(t, period="5d", progress=False)
-        if df5 is None or df5.empty:
-            st.warning("Price feed unavailable right now.")
-            st.markdown("---")
-            continue
-        last_price = float(df5["Close"].iloc[-1])
 
         col1, col2 = st.columns([2, 1])
 
@@ -131,20 +93,25 @@ def sector_page(sector_label: str):
             tradingview_chart(t)
 
         with col2:
-            volatility_meter(factors["atr_percent"], key=f"vol_{sector_label}_{t}")
+            volatility_meter(float(factors.get("atr_percent", 0.0)))
             st.write("")
             confidence = int((tech_score + sent_score) / 2)
-            confidence_gauge(confidence, key=f"conf_{sector_label}_{t}")
+            # If your confidence_gauge already accepts a key, pass it.
+            # Otherwise your previous fix in ui/analytics_cards.py should be fine.
+            try:
+                confidence_gauge(confidence, key=f"conf_{sector}_{t}")
+            except TypeError:
+                confidence_gauge(confidence)
 
         st.write("")
         st.markdown("### Alpha Score Breakdown")
 
         radar_alpha_chart(
-            factors["momentum"],
-            factors["trend_strength"],
-            factors["volume"],
-            sent_score,
-            factors["vol_adj"],
+            int(factors.get("momentum", 0)),
+            int(factors.get("trend_strength", 0)),
+            int(factors.get("volume", 0)),
+            int(factors.get("sent_score", 70)),
+            int(factors.get("vol_adj", 0)),
         )
 
         st.write("")
@@ -156,22 +123,16 @@ def sector_page(sector_label: str):
         with colB:
             sentiment_trend_meter(sent_score)
 
-        targets = compute_price_targets(t)
-        if not targets:
-            st.warning("Targets unavailable.")
-            st.markdown("---")
-            continue
-
         st.write("")
         st.markdown("### Targets & Risk")
 
         target_cards(
-            buy_low=targets["buy_low"],
-            buy_high=targets["buy_high"],
-            tp1=targets["tp1"],
-            tp2=targets["tp2"],
-            sl=targets["sl"],
-            rr=targets["rr"],
+            buy_low=targets.get("buy_low"),
+            buy_high=targets.get("buy_high"),
+            tp1=targets.get("tp1"),
+            tp2=targets.get("tp2"),
+            sl=targets.get("sl"),
+            rr=targets.get("rr"),
         )
 
         st.write("")
@@ -184,7 +145,22 @@ def sector_page(sector_label: str):
             sent_score=sent_score,
             targets=targets,
         )
-        st.info(commentary)
+
+        st.markdown(
+            f"""
+            <div style="
+                background:#0f1720;
+                padding:20px;
+                border-radius:12px;
+                border:1px solid rgba(255,255,255,0.08);
+                line-height:1.6;
+                font-size:16px;
+            ">
+                {commentary}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         st.write("")
         st.markdown("### Options Strategy Suggestion")
@@ -192,16 +168,18 @@ def sector_page(sector_label: str):
         strategy_name = choose_options_strategy(
             tech_score=tech_score,
             sent_score=sent_score,
-            atr_percent=factors["atr_percent"],
+            atr_percent=float(factors.get("atr_percent", 0.0)),
         )
 
-        options_data = generate_options_contracts(
-            ticker=t,
-            price=last_price,
-            atr=factors["atr_percent"],
-            strategy=strategy_name,
-        )
-
-        options_card(options_data)
+        if last_price is not None:
+            options_data = generate_options_contracts(
+                ticker=t,
+                price=float(last_price),
+                atr=float(factors.get("atr_percent", 0.0)),
+                strategy=strategy_name,
+            )
+            options_card(options_data)
+        else:
+            st.info("Could not fetch latest price for options suggestions right now.")
 
         st.markdown("---")
