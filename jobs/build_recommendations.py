@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import math
 import datetime as dt
+import logging
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
@@ -36,6 +38,14 @@ MIN_HISTORY_ROWS = 120
 MIN_PRICE = 5.0
 MIN_AVG_VOL_20D = 500_000
 
+YFINANCE_LOGGERS = ("yfinance", "yfinance.base", "urllib3")
+
+
+def _configure_logging() -> None:
+    for name in YFINANCE_LOGGERS:
+        logging.getLogger(name).setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore", message=".*No data found for this date range.*")
+
 
 # =========================
 # JSON SAFETY
@@ -46,6 +56,8 @@ def json_safe(x):
         return x.to_dict()
     if isinstance(x, pd.DataFrame):
         return x.to_dict(orient="records")
+    if isinstance(x, np.ndarray):
+        return [json_safe(v) for v in x.tolist()]
 
     if isinstance(x, (np.integer,)):
         return int(x)
@@ -54,6 +66,8 @@ def json_safe(x):
         return None if math.isnan(v) else v
     if isinstance(x, (np.bool_,)):
         return bool(x)
+    if isinstance(x, np.generic):
+        return json_safe(x.item())
 
     if isinstance(x, (pd.Timestamp, dt.datetime, dt.date)):
         return x.isoformat()
@@ -135,6 +149,7 @@ def _download_history(ticker: str) -> Optional[pd.DataFrame]:
             period=f"{LOOKBACK_DAYS}d",
             progress=False,
             auto_adjust=False,
+            threads=False,
         )
         if df is None or df.empty:
             return None
@@ -173,7 +188,10 @@ def rank_sector(sector: str, tickers: List[str]) -> List[Dict]:
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(score_ticker, t): t for t in tickers}
         for fut in as_completed(futures):
-            item = fut.result()
+            try:
+                item = fut.result()
+            except Exception:
+                item = None
             if item:
                 results.append(item)
 
@@ -191,8 +209,12 @@ def rank_sector(sector: str, tickers: List[str]) -> List[Dict]:
 # SUPABASE
 # =========================
 def upsert_recommendations(rows: List[Dict]) -> None:
-    supabase_url = os.environ["SUPABASE_URL"]
-    service_key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    supabase_url = os.environ.get("SUPABASE_URL")
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+    if not supabase_url or not service_key:
+        print("Supabase credentials missing; skipping upsert.")
+        return
 
     sb = create_client(supabase_url, service_key)
 
@@ -209,6 +231,7 @@ def upsert_recommendations(rows: List[Dict]) -> None:
 # MAIN
 # =========================
 def main() -> None:
+    _configure_logging()
     as_of = dt.date.today().isoformat()
     mapping = sector_to_tickers()
 
@@ -217,6 +240,7 @@ def main() -> None:
     for sector in SECTORS:
         tickers = mapping.get(sector, [])
         if not tickers:
+            print(f"[{sector}] no tickers available to scan")
             continue
 
         scan_list = (
@@ -226,6 +250,10 @@ def main() -> None:
         )
 
         ranked = rank_sector(sector, scan_list)
+        if len(ranked) < TOP_N_PER_SECTOR:
+            print(
+                f"[{sector}] only {len(ranked)} results; target is {TOP_N_PER_SECTOR}"
+            )
 
         for idx, rec in enumerate(ranked, start=1):
             all_rows.append(
