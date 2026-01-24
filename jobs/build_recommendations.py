@@ -6,8 +6,11 @@ from __future__ import annotations
 # - Scores remaining tickers
 # - Saves TOP rows into Supabase table: daily_recommendations
 #
-# Requires Supabase table column:
-#   entry jsonb
+# Requires Supabase table columns:
+#   factors jsonb
+#   targets jsonb
+#   entry   jsonb
+#   entry_price numeric (NEW - top-level numeric for UI/analytics)
 #
 # Env vars (GitHub Actions secrets):
 #   SUPABASE_URL
@@ -19,7 +22,7 @@ import datetime as dt
 import logging
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -46,7 +49,7 @@ LOOKBACK_DAYS = 260          # ~1 trading year
 MIN_HISTORY_ROWS = 120
 
 MAX_WORKERS = 8              # moderate to avoid throttling
-PER_SECTOR_TARGET = 15       # build more, then pick globally
+PER_SECTOR_TARGET = 15       # build more per sector, then pick globally
 TOTAL_DAILY_ROWS = 50        # HARD CAP total rows stored per day (your requirement)
 
 # Liquidity / tradability filters
@@ -120,7 +123,7 @@ def _safe_last_float(x) -> Optional[float]:
 def _download_history(ticker: str) -> Optional[pd.DataFrame]:
     """
     Robust yfinance download wrapper.
-    Returns a OHLCV df with required columns, or None.
+    Returns an OHLCV df with required columns, or None.
     """
     try:
         df = yf.download(
@@ -235,7 +238,7 @@ def _rank_items(items: List[Dict], top_n: int) -> List[Dict]:
     items.sort(
         key=lambda r: (
             -int(r["alpha_score"]),
-            float(r["factors"].get("atr_percent") or 9999),
+            float(r.get("factors", {}).get("atr_percent") or 9999),
         )
     )
     return items[:top_n]
@@ -322,14 +325,27 @@ def main() -> None:
     # 2) Pick TOP TOTAL_DAILY_ROWS globally
     sector_candidates = _rank_items(sector_candidates, TOTAL_DAILY_ROWS)
 
-    # 3) Assign global ranks within each sector for UI convenience
-    #    (rank column in DB is still required; we’ll rank within sector)
+    # 3) Assign ranks within each sector (rank column is per-sector)
     per_sector_rank: Dict[str, int] = {s: 0 for s in SECTORS}
     rows: List[Dict] = []
 
     for rec in sector_candidates:
         sec = rec["sector"]
         per_sector_rank[sec] = per_sector_rank.get(sec, 0) + 1
+
+        # NEW: entry_price (numeric) for UI and performance calculations
+        entry_price = None
+        try:
+            entry_price = float(rec.get("entry", {}).get("close"))
+        except Exception:
+            entry_price = None
+
+        if entry_price is None:
+            try:
+                entry_price = float(rec.get("factors", {}).get("last_price"))
+            except Exception:
+                entry_price = None
+
         rows.append(
             {
                 "as_of_date": as_of,
@@ -337,6 +353,7 @@ def main() -> None:
                 "rank": per_sector_rank[sec],
                 "ticker": rec["ticker"],
                 "alpha_score": int(rec["alpha_score"]),
+                "entry_price": entry_price,  # 👈 NEW TOP-LEVEL COLUMN
                 "factors": rec["factors"],
                 "targets": rec["targets"],
                 "entry": rec["entry"],
@@ -349,11 +366,9 @@ def main() -> None:
     upsert_rows(sb, rows)
 
     print(f"Done. Saved {len(rows)} rows for {as_of}.")
-    # quick summary
     for s in SECTORS:
-        print(f"  {s}: {per_sector_rank.get(s,0)} rows")
+        print(f"  {s}: {per_sector_rank.get(s, 0)} rows")
 
 
 if __name__ == "__main__":
     main()
-
