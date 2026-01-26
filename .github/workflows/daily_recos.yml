@@ -3,7 +3,7 @@ name: Daily AlphaBeacon Recommendations
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 9 * * 1-5"   # 9:30 AM UTC Mon-Fri (adjust later)
+    - cron: "5 14 * * 1-5"  # 14:05 UTC Mon-Fri
 
 jobs:
   run-recommender:
