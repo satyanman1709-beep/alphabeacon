@@ -17,11 +17,12 @@ Required GitHub Actions secrets:
 
 import os
 import math
+import time
 import datetime as dt
 import logging
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -62,6 +63,53 @@ def _configure_logging() -> None:
     for name in YFINANCE_LOGGERS:
         logging.getLogger(name).setLevel(logging.ERROR)
     warnings.filterwarnings("ignore", message=".*No data found for this date range.*")
+
+
+# =========================
+# HELPERS
+# =========================
+def normalize_ticker(t: str) -> str:
+    """
+    Yahoo uses dash for class shares: BRK.B -> BRK-B, BF.B -> BF-B
+    """
+    return (t or "").strip().upper().replace(".", "-")
+
+
+def _to_float(x: Any) -> Optional[float]:
+    """
+    Safely coerce values to float.
+    Handles: float/int, numpy scalars, pandas Series, lists/arrays with 1 element.
+    Avoids FutureWarning: float(Series).
+    """
+    if x is None:
+        return None
+
+    # pandas Series -> use first element
+    if isinstance(x, pd.Series):
+        if len(x) == 0:
+            return None
+        x = x.iloc[0]
+
+    # numpy array / list -> use last element
+    if isinstance(x, (np.ndarray, list, tuple)):
+        if len(x) == 0:
+            return None
+        x = np.array(x).reshape(-1)[-1]
+
+    # numpy scalar
+    if isinstance(x, np.generic):
+        x = x.item()
+
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 
 # =========================
@@ -121,33 +169,47 @@ def _safe_last_float(x) -> Optional[float]:
 # =========================
 def _download_history(ticker: str) -> Optional[pd.DataFrame]:
     """
-    Robust yfinance download wrapper.
+    Robust yfinance download wrapper with retries.
     Returns OHLCV df with required columns, or None.
     """
-    try:
-        df = yf.download(
-            ticker,
-            period=f"{LOOKBACK_DAYS}d",
-            progress=False,
-            auto_adjust=False,
-            threads=False,
-            timeout=25,
-        )
-        if df is None or df.empty:
-            return None
+    t = normalize_ticker(ticker)
 
-        required = ["Open", "High", "Low", "Close", "Volume"]
-        for col in required:
-            if col not in df.columns:
+    required = ["Open", "High", "Low", "Close", "Volume"]
+
+    # Retry/backoff to reduce Yahoo transient failures ("crumb"/401/etc.)
+    for attempt in range(1, 4):
+        try:
+            df = yf.download(
+                t,
+                period=f"{LOOKBACK_DAYS}d",
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+                timeout=25,
+            )
+
+            if df is None or df.empty:
+                raise RuntimeError("empty df")
+
+            for col in required:
+                if col not in df.columns:
+                    raise RuntimeError(f"missing col {col}")
+
+            df = df.dropna()
+            if len(df) < MIN_HISTORY_ROWS:
                 return None
 
-        df = df.dropna()
-        if len(df) < MIN_HISTORY_ROWS:
+            return df
+
+        except Exception as e:
+            # fail-soft: retry unless last attempt
+            if attempt < 3:
+                time.sleep(1.5 * attempt)
+                continue
+            # last attempt: give up
             return None
 
-        return df
-    except Exception:
-        return None
+    return None
 
 
 def compute_alpha_score_from_df(df: pd.DataFrame) -> Optional[Dict]:
@@ -213,7 +275,6 @@ def _estimate_horizon_days(atr_percent: float, alpha_score: int) -> int:
     else:
         base = 8
 
-    # Better score => slightly shorter expected time to move
     if alpha_score >= 80:
         base -= 1
     elif alpha_score <= 55:
@@ -254,7 +315,8 @@ def score_ticker(ticker: str) -> Optional[Dict]:
     Downloads history, scores alpha, computes targets.
     Returns dict for candidate list.
     """
-    df = _download_history(ticker)
+    t = normalize_ticker(ticker)
+    df = _download_history(t)
     if df is None:
         return None
 
@@ -266,25 +328,31 @@ def score_ticker(ticker: str) -> Optional[Dict]:
     if not targets:
         return None
 
-    entry_price = float(factors["last_price"])
-    stop_loss = float(targets["sl"])
-    tp1 = float(targets["tp1"])
-    rr = float(targets.get("rr") or 0.0)
+    entry_price = _to_float(factors.get("last_price"))
+    if entry_price is None or entry_price <= 0:
+        return None
 
-    expected_return_pct = round(((tp1 - entry_price) / entry_price) * 100.0, 2) if entry_price else None
-    horizon_days = _estimate_horizon_days(factors["atr_percent"], int(factors["alpha_score"]))
-    conf = _confidence(int(factors["alpha_score"]), float(factors["atr_percent"]), rr)
+    stop_loss = _to_float(targets.get("sl"))
+    tp1 = _to_float(targets.get("tp1"))
+    rr = _to_float(targets.get("rr")) or 0.0
+
+    if stop_loss is None or tp1 is None:
+        return None
+
+    expected_return_pct = round(((tp1 - entry_price) / entry_price) * 100.0, 2)
+    horizon_days = _estimate_horizon_days(float(factors.get("atr_percent") or 0.0), int(factors["alpha_score"]))
+    conf = _confidence(int(factors["alpha_score"]), float(factors.get("atr_percent") or 0.0), float(rr))
 
     return {
-        "ticker": ticker,
+        "ticker": t,
         "alpha_score": int(factors["alpha_score"]),
         "factors": factors,
         "targets": targets,
-        "entry_price": entry_price,
-        "stop_loss": stop_loss,
+        "entry_price": float(entry_price),
+        "stop_loss": float(stop_loss),
         "expected_return_pct": expected_return_pct,
-        "horizon_days": horizon_days,
-        "confidence": conf,
+        "horizon_days": int(horizon_days),
+        "confidence": int(conf),
     }
 
 
@@ -303,14 +371,20 @@ def _rank_items(items: List[Dict], top_n: int) -> List[Dict]:
 
 
 def rank_sector(sector: str, tickers: List[str], top_n: int) -> List[Dict]:
+    """
+    Thread-safe scoring: one bad ticker should NOT crash the whole workflow.
+    """
     results: List[Dict] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(score_ticker, t): t for t in tickers}
         for fut in as_completed(futures):
+            t = futures[fut]
             try:
                 item = fut.result()
-            except Exception:
+            except Exception as e:
+                print(f"[{sector}] failed ticker {t}: {e}")
                 item = None
+
             if item:
                 results.append(item)
 
@@ -336,7 +410,7 @@ def upsert_rows(sb, rows: List[Dict]) -> None:
     clean_rows = [json_safe(r) for r in rows]
     batch_size = 200
     for i in range(0, len(clean_rows), batch_size):
-        sb.table("daily_recommendations").upsert(clean_rows[i : i + batch_size]).execute()
+        sb.table("daily_recommendations").upsert(clean_rows[i: i + batch_size]).execute()
 
 
 def enrich_repeat_stats(sb, as_of: str, rows: List[Dict]) -> List[Dict]:
@@ -352,7 +426,6 @@ def enrich_repeat_stats(sb, as_of: str, rows: List[Dict]) -> List[Dict]:
     tickers = sorted({r["ticker"] for r in rows})
     start = (dt.date.fromisoformat(as_of) - dt.timedelta(days=30)).isoformat()
 
-    # Fetch last 30 days of past recos for these tickers
     resp = (
         sb.table("daily_recommendations")
         .select("ticker, as_of_date, entry_price")
@@ -364,7 +437,6 @@ def enrich_repeat_stats(sb, as_of: str, rows: List[Dict]) -> List[Dict]:
     )
     hist = resp.data or []
 
-    # Build per-ticker history
     by_ticker: Dict[str, List[Dict]] = {}
     for r in hist:
         by_ticker.setdefault(r["ticker"], []).append(r)
@@ -378,10 +450,10 @@ def enrich_repeat_stats(sb, as_of: str, rows: List[Dict]) -> List[Dict]:
             last = past[0]
             r["last_reco_date"] = last.get("as_of_date")
 
-            prev_entry = last.get("entry_price")
-            cur_entry = r.get("entry_price")
-            if prev_entry is not None and cur_entry is not None and float(prev_entry) != 0:
-                r["pct_change_since_last_reco"] = round(((float(cur_entry) / float(prev_entry)) - 1.0) * 100.0, 2)
+            prev_entry = _to_float(last.get("entry_price"))
+            cur_entry = _to_float(r.get("entry_price"))
+            if prev_entry is not None and cur_entry is not None and prev_entry != 0:
+                r["pct_change_since_last_reco"] = round(((cur_entry / prev_entry) - 1.0) * 100.0, 2)
             else:
                 r["pct_change_since_last_reco"] = None
         else:
